@@ -18,4 +18,16 @@ tavily_tool = TavilySearchResults(
     ),
 )
 
-TOOLS = [add, tavily_tool]
+
+@tool
+def end_negotiation():
+    """Signal that the negotiation is finished and trigger transcript analysis."""
+    return "ANALYZE"
+
+
+@tool
+def close_session():
+    """End the voice session after feedback is complete."""
+    return "END"
+
+TOOLS = [add, tavily_tool, end_negotiation, close_session]

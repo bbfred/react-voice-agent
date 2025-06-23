@@ -9,6 +9,7 @@ dependencies = [
     "langgraph>=0.2.32",
     "starlette>=0.39.2",
     "uvicorn[standard]>=0.31.0",
+    "openai>=1.14.0",
 ]
 
 [build-system]
