@@ -195,10 +195,13 @@ class OpenAIVoiceReactAgent(BaseModel):
         tool_executor = VoiceToolExecutor(tools_by_name=tools_by_name)
         transcripts: list[tuple[str, str]] = []
         close_session_called = False
+
+        
         pending_analysis: asyncio.Task[str] | None = None
         pending_analysis_call_id: str | None = None
         pending_close_call_id: str | None = None
 
+          
         async with connect(
             model=self.model, api_key=self.api_key.get_secret_value(), url=self.url
         ) as (
@@ -263,6 +266,7 @@ class OpenAIVoiceReactAgent(BaseModel):
                             transcript_text = "\n".join(
                                 f"{s}: {t}" for s, t in transcripts
                             )
+
                             pending_analysis = asyncio.create_task(
                                 self._analyze_transcript(transcript_text)
                             )
@@ -270,6 +274,7 @@ class OpenAIVoiceReactAgent(BaseModel):
                         elif tool_name == "close_session":
                             pending_close_call_id = data["call_id"]
                             close_session_called = True
+
                         else:
                             await tool_executor.add_tool_call(data)
                     elif t == "response.audio_transcript.done":
