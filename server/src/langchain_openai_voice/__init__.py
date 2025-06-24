@@ -195,6 +195,9 @@ class OpenAIVoiceReactAgent(BaseModel):
         tool_executor = VoiceToolExecutor(tools_by_name=tools_by_name)
         transcripts: list[tuple[str, str]] = []
         close_session_called = False
+        pending_analysis: asyncio.Task[str] | None = None
+        pending_analysis_call_id: str | None = None
+        pending_close_call_id: str | None = None
 
         async with connect(
             model=self.model, api_key=self.api_key.get_secret_value(), url=self.url
@@ -260,33 +263,13 @@ class OpenAIVoiceReactAgent(BaseModel):
                             transcript_text = "\n".join(
                                 f"{s}: {t}" for s, t in transcripts
                             )
-                            analysis = await self._analyze_transcript(transcript_text)
-                            await model_send(
-                                {
-                                    "type": "conversation.item.create",
-                                    "item": {
-                                        "id": data["call_id"],
-                                        "call_id": data["call_id"],
-                                        "type": "function_call_output",
-                                        "output": analysis,
-                                    },
-                                }
+                            pending_analysis = asyncio.create_task(
+                                self._analyze_transcript(transcript_text)
                             )
-                            await model_send({"type": "response.create", "response": {}})
+                            pending_analysis_call_id = data["call_id"]
                         elif tool_name == "close_session":
+                            pending_close_call_id = data["call_id"]
                             close_session_called = True
-                            await model_send(
-                                {
-                                    "type": "conversation.item.create",
-                                    "item": {
-                                        "id": data["call_id"],
-                                        "call_id": data["call_id"],
-                                        "type": "function_call_output",
-                                        "output": "END",
-                                    },
-                                }
-                            )
-                            await model_send({"type": "response.create", "response": {}})
                         else:
                             await tool_executor.add_tool_call(data)
                     elif t == "response.audio_transcript.done":
@@ -299,6 +282,38 @@ class OpenAIVoiceReactAgent(BaseModel):
                         pass
                     else:
                         print(t)
+
+                    if t == "response.done":
+                        if pending_analysis and pending_analysis_call_id:
+                            analysis = await pending_analysis
+                            await model_send(
+                                {
+                                    "type": "conversation.item.create",
+                                    "item": {
+                                        "id": pending_analysis_call_id,
+                                        "call_id": pending_analysis_call_id,
+                                        "type": "function_call_output",
+                                        "output": analysis,
+                                    },
+                                }
+                            )
+                            await model_send({"type": "response.create", "response": {}})
+                            pending_analysis = None
+                            pending_analysis_call_id = None
+                        if pending_close_call_id:
+                            await model_send(
+                                {
+                                    "type": "conversation.item.create",
+                                    "item": {
+                                        "id": pending_close_call_id,
+                                        "call_id": pending_close_call_id,
+                                        "type": "function_call_output",
+                                        "output": "END",
+                                    },
+                                }
+                            )
+                            await model_send({"type": "response.create", "response": {}})
+                            pending_close_call_id = None
 
                     if close_session_called and t == "response.done":
                         break
