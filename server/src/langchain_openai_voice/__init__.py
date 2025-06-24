@@ -193,6 +193,11 @@ class OpenAIVoiceReactAgent(BaseModel):
         # ]
         tools_by_name = {tool.name: tool for tool in self.tools}
         tool_executor = VoiceToolExecutor(tools_by_name=tools_by_name)
+        transcripts: list[tuple[str, str]] = []
+        close_session_called = False
+        pending_analysis: asyncio.Task[str] | None = None
+        pending_analysis_call_id: str | None = None
+        pending_close_call_id: str | None = None
 
         async with connect(
             model=self.model, api_key=self.api_key.get_secret_value(), url=self.url
@@ -253,15 +258,83 @@ class OpenAIVoiceReactAgent(BaseModel):
                         print("error:", data)
                     elif t == "response.function_call_arguments.done":
                         print("tool call", data)
-                        await tool_executor.add_tool_call(data)
+                        tool_name = data.get("name")
+                        if tool_name == "end_negotiation":
+                            transcript_text = "\n".join(
+                                f"{s}: {t}" for s, t in transcripts
+                            )
+                            pending_analysis = asyncio.create_task(
+                                self._analyze_transcript(transcript_text)
+                            )
+                            pending_analysis_call_id = data["call_id"]
+                        elif tool_name == "close_session":
+                            pending_close_call_id = data["call_id"]
+                            close_session_called = True
+                        else:
+                            await tool_executor.add_tool_call(data)
                     elif t == "response.audio_transcript.done":
+                        transcripts.append(("model", data["transcript"]))
                         print("model:", data["transcript"])
                     elif t == "conversation.item.input_audio_transcription.completed":
+                        transcripts.append(("user", data["transcript"]))
                         print("user:", data["transcript"])
                     elif t in EVENTS_TO_IGNORE:
                         pass
                     else:
                         print(t)
+
+                    if t == "response.done":
+                        if pending_analysis and pending_analysis_call_id:
+                            analysis = await pending_analysis
+                            await model_send(
+                                {
+                                    "type": "conversation.item.create",
+                                    "item": {
+                                        "id": pending_analysis_call_id,
+                                        "call_id": pending_analysis_call_id,
+                                        "type": "function_call_output",
+                                        "output": analysis,
+                                    },
+                                }
+                            )
+                            await model_send({"type": "response.create", "response": {}})
+                            pending_analysis = None
+                            pending_analysis_call_id = None
+                        if pending_close_call_id:
+                            await model_send(
+                                {
+                                    "type": "conversation.item.create",
+                                    "item": {
+                                        "id": pending_close_call_id,
+                                        "call_id": pending_close_call_id,
+                                        "type": "function_call_output",
+                                        "output": "END",
+                                    },
+                                }
+                            )
+                            await model_send({"type": "response.create", "response": {}})
+                            pending_close_call_id = None
+
+                    if close_session_called and t == "response.done":
+                        break
+
+
+    async def _analyze_transcript(self, transcript: str) -> str:
+        """Send the transcript to another LLM for analysis."""
+        import openai
+
+        client = openai.AsyncOpenAI(api_key=self.api_key.get_secret_value())
+        resp = await client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a negotiation coach. Provide feedback on the conversation transcript.",
+                },
+                {"role": "user", "content": transcript},
+            ],
+        )
+        return resp.choices[0].message.content
 
 
 __all__ = ["OpenAIVoiceReactAgent"]
