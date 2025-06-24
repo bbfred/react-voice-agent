@@ -39,13 +39,6 @@ async def connect(*, api_key: str, model: str, url: str) -> AsyncGenerator[
     ],
     None,
 ]:
-    """
-    async with connect(model="gpt-4o-realtime-preview-2024-10-01") as websocket:
-        await websocket.send("Hello, world!")
-        async for message in websocket:
-            print(message)
-    """
-
     headers = {
         "Authorization": f"Bearer {api_key}",
         "OpenAI-Beta": "realtime=v1",
@@ -57,7 +50,6 @@ async def connect(*, api_key: str, model: str, url: str) -> AsyncGenerator[
     websocket = await websockets.connect(url, extra_headers=headers)
 
     try:
-
         async def send_event(event: dict[str, Any] | str) -> None:
             formatted_event = json.dumps(event) if isinstance(event, dict) else event
             await websocket.send(formatted_event)
@@ -66,45 +58,30 @@ async def connect(*, api_key: str, model: str, url: str) -> AsyncGenerator[
             async for raw_event in websocket:
                 yield json.loads(raw_event)
 
-        stream: AsyncIterator[dict[str, Any]] = event_stream()
-
-        yield send_event, stream
+        yield send_event, event_stream()
     finally:
         await websocket.close()
 
 
 class VoiceToolExecutor(BaseModel):
-    """
-    Can accept function calls and emits function call outputs to a stream.
-    """
-
     tools_by_name: dict[str, BaseTool]
     _trigger_future: asyncio.Future = PrivateAttr(default_factory=asyncio.Future)
     _lock: asyncio.Lock = PrivateAttr(default_factory=asyncio.Lock)
 
-    async def _trigger_func(self) -> dict:  # returns a tool call
+    async def _trigger_func(self) -> dict:
         return await self._trigger_future
 
     async def add_tool_call(self, tool_call: dict) -> None:
-        # lock to avoid simultaneous tool calls racing and missing
-        # _trigger_future being
         async with self._lock:
             if self._trigger_future.done():
-                # TODO: handle simultaneous tool calls better
                 raise ValueError("Tool call adding already in progress")
-
             self._trigger_future.set_result(tool_call)
 
     async def _create_tool_call_task(self, tool_call: dict) -> asyncio.Task[dict]:
         tool = self.tools_by_name.get(tool_call["name"])
         if tool is None:
-            # immediately yield error, do not add task
-            raise ValueError(
-                f"tool {tool_call['name']} not found. "
-                f"Must be one of {list(self.tools_by_name.keys())}"
-            )
+            raise ValueError(f"tool {tool_call['name']} not found. Must be one of {list(self.tools_by_name.keys())}")
 
-        # try to parse args
         try:
             args = json.loads(tool_call["arguments"])
         except json.JSONDecodeError:
@@ -117,11 +94,11 @@ class VoiceToolExecutor(BaseModel):
             try:
                 result_str = json.dumps(result)
             except TypeError:
-                # not json serializable, use str
                 result_str = str(result)
             return {
                 "type": "conversation.item.create",
                 "item": {
+                    "role": "tool",
                     "id": tool_call["call_id"],
                     "call_id": tool_call["call_id"],
                     "type": "function_call_output",
@@ -129,12 +106,11 @@ class VoiceToolExecutor(BaseModel):
                 },
             }
 
-        task = asyncio.create_task(run_tool())
-        return task
+        return asyncio.create_task(run_tool())
 
-    async def output_iterator(self) -> AsyncIterator[dict]:  # yield events
+    async def output_iterator(self) -> AsyncIterator[dict]:
         trigger_task = asyncio.create_task(self._trigger_func())
-        tasks = set([trigger_task])
+        tasks = {trigger_task}
         while True:
             done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
             for task in done:
@@ -152,10 +128,11 @@ class VoiceToolExecutor(BaseModel):
                         yield {
                             "type": "conversation.item.create",
                             "item": {
+                                "role": "assistant",
                                 "id": tool_call["call_id"],
                                 "call_id": tool_call["call_id"],
                                 "type": "function_call_output",
-                                "output": (f"Error: {str(e)}"),
+                                "output": f"Error: {str(e)}",
                             },
                         }
                 else:
@@ -178,37 +155,21 @@ class OpenAIVoiceReactAgent(BaseModel):
         input_stream: AsyncIterator[str],
         send_output_chunk: Callable[[str], Coroutine[Any, Any, None]],
     ) -> None:
-        """
-        Connect to the OpenAI API and send and receive messages.
-
-        input_stream: AsyncIterator[str]
-            Stream of input events to send to the model. Usually transports input_audio_buffer.append events from the microphone.
-        output: Callable[[str], None]
-            Callback to receive output events from the model. Usually sends response.audio.delta events to the speaker.
-
-        """
-        # formatted_tools: list[BaseTool] = [
-        #     tool if isinstance(tool, BaseTool) else tool_converter.wr(tool)  # type: ignore
-        #     for tool in self.tools or []
-        # ]
-        tools_by_name = {tool.name: tool for tool in self.tools}
+        tools_by_name = {tool.name: tool for tool in self.tools or []}
         tool_executor = VoiceToolExecutor(tools_by_name=tools_by_name)
         transcripts: list[tuple[str, str]] = []
         close_session_called = False
 
-        
         pending_analysis: asyncio.Task[str] | None = None
         pending_analysis_call_id: str | None = None
         pending_close_call_id: str | None = None
 
-          
+        retry_delay = 1.0
+
         async with connect(
             model=self.model, api_key=self.api_key.get_secret_value(), url=self.url
-        ) as (
-            model_send,
-            model_receive_stream,
-        ):
-            # sent tools and instructions with initial chunk
+        ) as (model_send, model_receive_stream):
+            # send initial session update
             tool_defs = [
                 {
                     "type": "function",
@@ -218,124 +179,124 @@ class OpenAIVoiceReactAgent(BaseModel):
                 }
                 for tool in tools_by_name.values()
             ]
-            await model_send(
-                {
-                    "type": "session.update",
-                    "session": {
-                        "instructions": self.instructions,
-                        "input_audio_transcription": {
-                            "model": "whisper-1",
-                        },
-                        "tools": tool_defs,
-                    },
-                }
-            )
-            async for stream_key, data_raw in amerge(
-                input_mic=input_stream,
-                output_speaker=model_receive_stream,
-                tool_outputs=tool_executor.output_iterator(),
-            ):
-                try:
-                    data = (
-                        json.loads(data_raw) if isinstance(data_raw, str) else data_raw
-                    )
-                except json.JSONDecodeError:
-                    print("error decoding data:", data_raw)
-                    continue
+            await model_send({
+                "type": "session.update",
+                "session": {
+                    "instructions": self.instructions,
+                    "input_audio_transcription": {"model": "whisper-1"},
+                    "tools": tool_defs,
+                },
+            })
 
-                if stream_key == "input_mic":
-                    await model_send(data)
-                elif stream_key == "tool_outputs":
-                    print("tool output", data)
-                    await model_send(data)
-                    await model_send({"type": "response.create", "response": {}})
-                elif stream_key == "output_speaker":
+            try:
+                async for stream_key, data_raw in amerge(
+                    input_mic=input_stream,
+                    output_speaker=model_receive_stream,
+                    tool_outputs=tool_executor.output_iterator(),
+                ):
+                    try:
+                        data = json.loads(data_raw) if isinstance(data_raw, str) else data_raw
+                    except json.JSONDecodeError:
+                        continue
 
-                    t = data["type"]
-                    if t == "response.audio.delta":
-                        await send_output_chunk(json.dumps(data))
-                    elif t == "input_audio_buffer.speech_started":
-                        print("interrupt")
-                        send_output_chunk(json.dumps(data))
-                    elif t == "error":
-                        print("error:", data)
-                    elif t == "response.function_call_arguments.done":
-                        print("tool call", data)
-                        tool_name = data.get("name")
-                        if tool_name == "end_negotiation":
-                            transcript_text = "\n".join(
-                                f"{s}: {t}" for s, t in transcripts
-                            )
+                    if stream_key == "input_mic":
+                        await model_send(data)
 
-                            pending_analysis = asyncio.create_task(
-                                self._analyze_transcript(transcript_text)
-                            )
-                            pending_analysis_call_id = data["call_id"]
-                        elif tool_name == "close_session":
-                            pending_close_call_id = data["call_id"]
-                            close_session_called = True
+                    elif stream_key == "tool_outputs":
+                        await model_send(data)
+                        await model_send({"type": "response.create", "response": {}})
 
-                        else:
-                            await tool_executor.add_tool_call(data)
-                    elif t == "response.audio_transcript.done":
-                        transcripts.append(("model", data["transcript"]))
-                        print("model:", data["transcript"])
-                    elif t == "conversation.item.input_audio_transcription.completed":
-                        transcripts.append(("user", data["transcript"]))
-                        print("user:", data["transcript"])
-                    elif t in EVENTS_TO_IGNORE:
-                        pass
-                    else:
-                        print(t)
+                    elif stream_key == "output_speaker":
+                        t = data.get("type")
 
-                    if t == "response.done":
-                        if pending_analysis and pending_analysis_call_id:
-                            analysis = await pending_analysis
-                            await model_send(
-                                {
+                        if t == "response.audio.delta":
+                            await send_output_chunk(json.dumps(data))
+
+                        elif t == "input_audio_buffer.speech_started":
+                            await send_output_chunk(json.dumps(data))
+
+                        elif t == "error":
+                            # handle rate limits
+                            err = data.get("error", {})
+                            if err.get("code") == 429:
+                                await asyncio.sleep(retry_delay)
+                                retry_delay = min(retry_delay * 2, 32)
+                                continue
+                            else:
+                                retry_delay = 1.0
+
+                        elif t == "response.function_call_arguments.done":
+                            name = data.get("name")
+                            if name == "end_negotiation":
+                                transcript_text = "\n".join(f"{s}: {t}" for s, t in transcripts)
+                                pending_analysis = asyncio.create_task(
+                                    self._analyze_transcript(transcript_text)
+                                )
+                                pending_analysis_call_id = data["call_id"]
+
+                            elif name == "close_session":
+                                pending_close_call_id = data["call_id"]
+                                close_session_called = True
+
+                            else:
+                                await tool_executor.add_tool_call(data)
+
+                        elif t == "response.audio_transcript.done":
+                            transcripts.append(("model", data["transcript"]))
+
+                        elif t == "conversation.item.input_audio_transcription.completed":
+                            transcripts.append(("user", data["transcript"]))
+
+                        elif t in EVENTS_TO_IGNORE:
+                            pass
+
+                        if t == "response.done":
+                            retry_delay = 1.0
+                            if pending_analysis and pending_analysis_call_id:
+                                analysis = await pending_analysis
+                                await model_send({
                                     "type": "conversation.item.create",
                                     "item": {
+                                        "role": "assistant",
                                         "id": pending_analysis_call_id,
                                         "call_id": pending_analysis_call_id,
                                         "type": "function_call_output",
                                         "output": analysis,
                                     },
-                                }
-                            )
-                            await model_send({"type": "response.create", "response": {}})
-                            pending_analysis = None
-                            pending_analysis_call_id = None
-                        if pending_close_call_id:
-                            await model_send(
-                                {
+                                })
+                                await model_send({"type": "response.create", "response": {}})
+                                pending_analysis = None
+                                pending_analysis_call_id = None
+
+                            if pending_close_call_id:
+                                await model_send({
                                     "type": "conversation.item.create",
                                     "item": {
+                                        "role": "assistant",
                                         "id": pending_close_call_id,
                                         "call_id": pending_close_call_id,
                                         "type": "function_call_output",
                                         "output": "END",
                                     },
-                                }
-                            )
-                            await model_send({"type": "response.create", "response": {}})
-                            pending_close_call_id = None
+                                })
+                                await model_send({"type": "response.create", "response": {}})
+                                pending_close_call_id = None
 
-                    if close_session_called and t == "response.done":
-                        break
+                        if close_session_called and t == "response.done":
+                            break
 
+            except StopAsyncIteration:
+                # clean shutdown
+                pass
 
     async def _analyze_transcript(self, transcript: str) -> str:
-        """Send the transcript to another LLM for analysis."""
         import openai
 
         client = openai.AsyncOpenAI(api_key=self.api_key.get_secret_value())
         resp = await client.chat.completions.create(
             model="gpt-4o",
             messages=[
-                {
-                    "role": "system",
-                    "content": "You are a negotiation coach. Provide feedback on the conversation transcript.",
-                },
+                {"role": "system", "content": "You are a negotiation coach. Provide feedback on the conversation transcript."},
                 {"role": "user", "content": transcript},
             ],
         )
